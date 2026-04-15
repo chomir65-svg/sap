@@ -1,0 +1,236 @@
+import com.sap.conn.jco.*;
+import java.util.*;
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * SAP RFC Callable Evidence Mega Audit (Unrestricted Edition)
+ * 목표: 모든 카탈로그 대상에 대해 실제 호출을 시도하여 실행 권한 존재 여부를 증명함.
+ */
+public class SapRfcCallableEvidenceMegaAudit {
+    private static final String DEST_NAME = "SAP_CALLABLE_EVIDENCE_DEST";
+    private static final int PARAM_PREVIEW_LIMIT = 12;
+
+    enum ProbeResultType {
+        METADATA_ONLY,
+        DENIED_RFC_AUTH,
+        CALL_REACHED_BACKEND,
+        COMM_OR_SYSTEM_ERROR,
+        NOT_FOUND,
+        ERROR
+    }
+
+    // 보고서에서 강조할 고위험 RFC 리스트
+    private static final Set<String> HIGH_VALUE_RFC = new LinkedHashSet<>(Arrays.asList(
+        "RFC_READ_TABLE", "BBP_RFC_READ_TABLE", "DSY_READ_TABLE", "RFC_GET_TABLE_ENTRIES",
+        "RZL_READ_FILE_LOCAL", "RZL_WRITE_FILE_LOCAL", "RZL_READ_DIR_LOCAL", "EPS_GET_DIRECTORY_LISTING",
+        "TH_USER_LIST", "TH_USER_INFO", "TH_DELETE_USER",
+        "BAPI_USER_GET_DETAIL", "BAPI_USER_CREATE", "BAPI_USER_CHANGE", "BAPI_USER_UNLOCK", "SUSR_LOGIN_CHECK_RFC",
+        "RFC_SYSTEM_INFO", "SXPG_COMMAND_EXECUTE", "SXPG_CALL_SYSTEM", "RFC_REMOTE_EXEC",
+        "RFC_ABAP_INSTALL_AND_RUN", "RS_STP_COMMAND_EXECUTE", "BP_JOB_SELECT", "BP_JOB_DELETE"
+    ));
+
+    public static void main(String[] args) {
+        Properties props = new Properties();
+        // [필독] 실제 환경 정보로 수정하세요.
+        props.setProperty("jco.client.ashost", "SAP_IP");
+        props.setProperty("jco.client.sysnr",  "00");
+        props.setProperty("jco.client.client", "100");
+        props.setProperty("jco.client.user",   "USER_ID");
+        props.setProperty("jco.client.passwd", "PASSWORD");
+        props.setProperty("jco.client.lang",   "KO");
+
+        try {
+            createDestinationFile(DEST_NAME, props);
+            JCoDestination dest = JCoDestinationManager.getDestination(DEST_NAME);
+            JCoRepository repo = dest.getRepository();
+            JCoAttributes attr = dest.getAttributes();
+
+            LinkedHashMap<String, LinkedHashSet<String>> categoryMap = buildTargetCatalog();
+            List<String[]> rows = new ArrayList<>();
+            
+            // CSV 헤더
+            rows.add(new String[]{
+                "CATEGORY", "RFC_NAME", "REPO_VISIBLE", "PROBE_ATTEMPTED",
+                "PROBE_RESULT", "HIGHLIGHT", "EVIDENCE_LEVEL", "JCO_GROUP",
+                "MESSAGE", "INTERPRETATION", "EVIDENCE_DATA",
+                "IMPORT_PARAMS", "EXPORT_PARAMS", "TABLE_PARAMS"
+            });
+
+            System.out.println("==================================================================");
+            System.out.println("     [SAP RFC AUDIT - UNRESTRICTED EXECUTION MODE]");
+            System.out.println("==================================================================");
+            System.out.println("System: " + attr.getSystemID() + " | User: " + attr.getUser());
+            System.out.println("Mode: FULL PROBE (Attempting execution for ALL targets)");
+            System.out.println("==================================================================");
+
+            int total = 0, callableCount = 0;
+
+            for (Map.Entry<String, LinkedHashSet<String>> entry : categoryMap.entrySet()) {
+                String category = entry.getKey();
+                for (String rfcName : entry.getValue()) {
+                    total++;
+                    String[] row = inspectAndExecute(dest, repo, category, rfcName);
+                    rows.add(row);
+                    if (row[5].contains("CALLABLE")) callableCount++;
+                }
+            }
+
+            writeCsv("sap_rfc_full_evidence_report.csv", rows);
+            System.out.println("\nScan Complete. Total: " + total + ", Confirmed Callable: " + callableCount);
+
+        } catch (Exception e) {
+            System.err.println("[!] Audit Failed: " + e.getMessage());
+        }
+    }
+
+    private static String[] inspectAndExecute(JCoDestination dest, JCoRepository repo, String category, String rfcName) {
+        String repoVisible = "N", probeAttempted = "Y", probeResult = ProbeResultType.NOT_FOUND.name();
+        String highlight = "NONE", evidenceLevel = "LOW", jcoGroup = "", message = "", interpretation = "", evidenceData = "NO_DATA";
+        String imports = "", exports = "", tables = "";
+
+        try {
+            JCoFunction func = repo.getFunction(rfcName);
+            if (func == null) {
+                return new String[]{category, rfcName, "N", "N", "NOT_FOUND", "NONE", "LOW", "", "Repository Null", "지원하지 않거나 권한 없음", "NO_DATA", "", "", ""};
+            }
+
+            repoVisible = "Y";
+            imports = summarizeParams(func.getImportParameterList());
+            exports = summarizeParams(func.getExportParameterList());
+            tables = summarizeParams(func.getTableParameterList());
+
+            // [변경점] Allowlist 체크 없이 모든 RFC를 execute() 시도
+            try {
+                injectPayload(func, rfcName);
+                func.execute(dest);
+                probeResult = ProbeResultType.CALL_REACHED_BACKEND.name();
+                message = "Execution successful";
+                evidenceData = extractEvidence(func, rfcName);
+            } catch (JCoException e) {
+                jcoGroup = String.valueOf(e.getGroup());
+                message = e.getMessage().replace("\n", " ");
+                probeResult = classifyProbeResult(e, rfcName).name();
+            }
+
+            highlight = decideHighlight(rfcName, repoVisible, probeResult, evidenceData);
+            evidenceLevel = highlight.contains("HIGH") ? "HIGH" : (highlight.equals("CALLABLE") ? "MEDIUM" : "LOW");
+            interpretation = buildInterpretation(repoVisible, "Y", probeResult);
+
+            System.out.printf("[%s] %-30s -> %s\n", highlight.equals("NONE")?" ":"V", rfcName, probeResult);
+
+            return new String[]{category, rfcName, repoVisible, "Y", probeResult, highlight, evidenceLevel, jcoGroup, message, interpretation, evidenceData, imports, exports, tables};
+
+        } catch (Exception e) {
+            return new String[]{category, rfcName, "Y", "Y", "ERROR", "ERROR", "LOW", "", e.getMessage(), "Internal Error", "NO_DATA", "", "", ""};
+        }
+    }
+
+    private static String extractEvidence(JCoFunction func, String rfcName) {
+        try {
+            if ("RFC_SYSTEM_INFO".equals(rfcName)) {
+                JCoParameterList exp = func.getExportParameterList();
+                if (exp == null) return "SUCCESS_NO_EXPORT_LIST";
+                JCoStructure si = exp.getStructure("RFCSI_EXPORT");
+                
+                // 필드 존재 여부를 모르므로 모든 필드 순회 추출 (에러 방지 핵심)
+                StringBuilder sb = new StringBuilder();
+                JCoRecordFieldIterator iter = si.getFieldIterator();
+                while (iter.hasNextField()) {
+                    JCoRecordField f = iter.nextField();
+                    sb.append(f.getName()).append(":").append(f.getValue()).append(" | ");
+                }
+                return sb.toString();
+            }
+            if (rfcName.contains("READ_TABLE")) {
+                JCoTable data = func.getTableParameterList().getTable("DATA");
+                return data.getNumRows() > 0 ? "Table Entries Found: " + data.getNumRows() : "Empty Table";
+            }
+            if ("TH_USER_LIST".equals(rfcName)) {
+                return "Active Users: " + func.getTableParameterList().getTable("USRLIST").getNumRows();
+            }
+        } catch (Exception e) { return "PARSE_ERROR: " + e.getMessage(); }
+        return "SUCCESS_CALL_CONFIRMED";
+    }
+
+    private static void writeCsv(String fileName, List<String[]> rows) throws IOException {
+        try (FileOutputStream fos = new FileOutputStream(fileName);
+             OutputStreamWriter osw = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
+            
+            osw.write('\uFEFF'); // UTF-8 BOM 삽입 (엑셀 한글 깨짐 방지)
+            try (BufferedWriter bw = new BufferedWriter(osw)) {
+                for (String[] row : rows) {
+                    StringBuilder line = new StringBuilder();
+                    for (int i = 0; i < row.length; i++) {
+                        if (i > 0) line.append(",");
+                        String val = row[i] == null ? "" : row[i].replace("\"", "\"\"").replace("\n", " ");
+                        line.append("\"").append(val).append("\"");
+                    }
+                    bw.write(line.toString());
+                    bw.newLine();
+                }
+            }
+        }
+    }
+
+    // --- 나머지 보조 메서드들 ---
+    private static void injectPayload(JCoFunction func, String rfcName) {
+        try {
+            if (rfcName.contains("READ_TABLE")) {
+                func.getImportParameterList().setValue("QUERY_TABLE", "T000"); // 안전한 시스템 테이블
+                func.getImportParameterList().setValue("ROWCOUNT", 1);
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private static ProbeResultType classifyProbeResult(JCoException e, String rfcName) {
+        String msg = e.getMessage().toLowerCase();
+        if (msg.contains("authorization") || msg.contains("not authorized")) return ProbeResultType.DENIED_RFC_AUTH;
+        // 특정 필드가 필요하다는 에러가 나면, 호출 자체는 성공한 것으로 간주 (백엔드 도달)
+        if (msg.contains("required") || msg.contains("query_table") || msg.contains("parameter")) return ProbeResultType.CALL_REACHED_BACKEND;
+        return ProbeResultType.ERROR;
+    }
+
+    private static String decideHighlight(String rfcName, String repoVisible, String probeResult, String evidence) {
+        if (!"NO_DATA".equals(evidence) && !evidence.startsWith("PARSE_ERROR") && !"SUCCESS_NO_DATA".equals(evidence)) return "HIGH_VALUE_CALLABLE";
+        if (ProbeResultType.CALL_REACHED_BACKEND.name().equals(probeResult)) return "CALLABLE";
+        return "Y".equals(repoVisible) ? "EXPOSED_METADATA" : "NONE";
+    }
+
+    private static String buildInterpretation(String repoVisible, String probeAttempted, String probeResult) {
+        if (!"Y".equals(repoVisible)) return "접근 불가";
+        if (ProbeResultType.CALL_REACHED_BACKEND.name().equals(probeResult)) return "백엔드 호출 성공 (권한 과다)";
+        if (ProbeResultType.DENIED_RFC_AUTH.name().equals(probeResult)) return "권한에 의해 차단됨";
+        return "잠재적 노출";
+    }
+
+    private static void createDestinationFile(String name, Properties props) throws IOException {
+        File f = new File(name + ".jcoDestination");
+        try (FileOutputStream fos = new FileOutputStream(f)) { props.store(fos, "SAP Config"); }
+    }
+
+    private static String summarizeParams(JCoParameterList list) {
+        if (list == null) return "-";
+        JCoListMetaData meta = list.getMetaData();
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < Math.min(meta.getFieldCount(), PARAM_PREVIEW_LIMIT); i++) {
+            if (i > 0) sb.append("|");
+            sb.append(meta.getName(i));
+        }
+        return sb.toString();
+    }
+
+    private static void addCategory(LinkedHashMap<String, LinkedHashSet<String>> map, String cat, String... rfcs) {
+        map.putIfAbsent(cat, new LinkedHashSet<>());
+        for (String r : rfcs) if (r != null) map.get(cat).add(r.trim());
+    }
+
+    private static LinkedHashMap<String, LinkedHashSet<String>> buildTargetCatalog() {
+        LinkedHashMap<String, LinkedHashSet<String>> map = new LinkedHashMap<>();
+        // (사용자가 제공한 buildTargetCatalog 리스트를 여기에 그대로 넣으시면 됩니다.)
+        addCategory(map, "SYSTEM", "RFC_PING", "STFC_CONNECTION", "RFC_SYSTEM_INFO");
+        addCategory(map, "DB", "RFC_READ_TABLE", "BBP_RFC_READ_TABLE");
+        // ... 생략 (제공해주신 500개 카탈로그 로직 사용)
+        return map;
+    }
+}
