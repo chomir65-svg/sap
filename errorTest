@@ -1,0 +1,30 @@
+private static String extractEvidence(JCoFunction func, String rfcName) {
+    try {
+        if ("RFC_SYSTEM_INFO".equals(rfcName)) {
+            JCoParameterList exp = func.getExportParameterList();
+            if (exp == null) return "PARSE_ERROR: Export Parameter List is Null";
+            
+            try {
+                // 특정 버전에선 RFCSI_EXPORT가 아니라 RFCSI일 수 있음
+                JCoStructure si = exp.getStructure("RFCSI_EXPORT");
+                return String.format("OS:%s, DB:%s, Release:%s", 
+                    si.getString("RFCOPSYS"), 
+                    si.getString("RFCDBHOST"), 
+                    si.getString("RFCSYSREL"));
+            } catch (Exception e) {
+                return "PARSE_ERROR: Structure(RFCSI_EXPORT) detail: " + e.getMessage();
+            }
+        }
+        
+        if (rfcName.contains("READ_TABLE")) {
+            JCoParameterList tables = func.getTableParameterList();
+            if (tables == null) return "PARSE_ERROR: Table Parameter List is Null";
+            
+            JCoTable data = tables.getTable("DATA");
+            return data.getNumRows() > 0 ? "Table Data Sample Found (" + data.getNumRows() + " rows)" : "Empty Table";
+        }
+    } catch (Exception e) { 
+        return "PARSE_ERROR: Unexpected error in " + rfcName + " -> " + e.getMessage(); 
+    }
+    return "SUCCESS_NO_DATA";
+}
