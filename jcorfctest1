@@ -1,0 +1,97 @@
+import com.sap.conn.jco.*;
+import java.util.Properties;
+import java.io.File;
+import java.io.FileOutputStream;
+
+public class RfcAuditTool {
+    public static void main(String[] args) {
+        String destName = "AUDIT_DEST";
+        Properties props = new Properties();
+
+        // 1. 접속 정보 설정 (대상 서버 정보로 수정)
+        props.setProperty("jco.client.ashost", "SAP_IP_ADDRESS");
+        props.setProperty("jco.client.sysnr",  "00");
+        props.setProperty("jco.client.client", "100");
+        props.setProperty("jco.client.user",   "YOUR_ID");
+        props.setProperty("jco.client.passwd", "YOUR_PW");
+        props.setProperty("jco.client.lang",   "KO");
+
+        try {
+            createDestinationFile(destName, props);
+            JCoDestination destination = JCoDestinationManager.getDestination(destName);
+            
+            System.out.println("=== [SAP RFC 권한 진단 시작] ===");
+            destination.ping();
+            System.out.println("[+] 연결 성공: " + destination.getAttributes().getHost());
+
+            // 2. 검색 권한이 있을 경우: 패턴별 목록 추출
+            System.out.println("\n--- [1. 호출 가능한 RFC 패턴 검색] ---");
+            String[] searchPatterns = {"EPS_*", "RZL_*", "RFC_*", "SXPG_*", "Z*"};
+            for (String pattern : searchPatterns) {
+                findRfcByPattern(destination, pattern);
+            }
+
+            // 3. 검색 권한이 없을 경우를 대비한: 주요 위험 RFC 직접 점검
+            System.out.println("\n--- [2. 주요 위험 RFC 개별 점검] ---");
+            String[] criticalRfcs = {
+                "EPS_GET_DIRECTORY_LISTING", // 디렉토리 리스팅
+                "RZL_READ_FILE_LOCAL",       // 파일 읽기
+                "RFC_REMOTE_EXEC",           // OS 명령 실행
+                "TH_USER_LIST",              // 접속자 명단 확인
+                "BAPI_USER_GET_DETAIL"       // 사용자 상세 정보
+            };
+            for (String rfc : criticalRfcs) {
+                checkSingleRfc(destination, rfc);
+            }
+
+        } catch (Exception e) {
+            System.err.println("[!] 에러 발생: " + e.getMessage());
+        }
+    }
+
+    // 패턴 검색 함수
+    public static void findRfcByPattern(JCoDestination dest, String pattern) {
+        try {
+            JCoFunction searchFunc = dest.getRepository().getFunction("RFC_GET_FUNCTION_SEARCH");
+            if (searchFunc == null) {
+                System.out.println("[-] [" + pattern + "] 검색 불가: RFC_GET_FUNCTION_SEARCH 권한 없음");
+                return;
+            }
+
+            searchFunc.getImportParameterList().setValue("FUNCNAME", pattern);
+            searchFunc.execute(dest);
+            JCoTable table = searchFunc.getTableParameterList().getTable("FUNCTIONS");
+
+            if (table.getNumRows() > 0) {
+                System.out.println("[+] " + pattern + " 관련 함수 " + table.getNumRows() + "개 발견");
+                for (int i = 0; i < table.getNumRows(); i++) {
+                    table.setRow(i);
+                    System.out.println("    - " + table.getString("FUNCNAME"));
+                }
+            }
+        } catch (Exception e) {
+            System.out.println("[-] " + pattern + " 검색 중 오류: " + e.getMessage());
+        }
+    }
+
+    // 단일 함수 존재 여부 및 실행 권한 점검
+    public static void checkSingleRfc(JCoDestination dest, String rfcName) {
+        try {
+            JCoFunction function = dest.getRepository().getFunction(rfcName);
+            if (function != null) {
+                System.out.println("[★위험★] " + rfcName + " : 접근 가능 (함수 정의 로드 성공)");
+            } else {
+                System.out.println("[OK] " + rfcName + " : 접근 불가");
+            }
+        } catch (Exception e) {
+            System.out.println("[-] " + rfcName + " : 점검 중 에러 (" + e.getMessage() + ")");
+        }
+    }
+
+    static void createDestinationFile(String name, Properties props) throws Exception {
+        File destFile = new File(name + ".jcoDestination");
+        try (FileOutputStream fos = new FileOutputStream(destFile)) {
+            props.store(fos, "RFC Audit Config");
+        }
+    }
+}
