@@ -1,0 +1,25 @@
+private static void writeCsv(String fileName, List<String[]> rows) throws IOException {
+    // FileOutputStream을 사용하여 바이트 단위로 제어
+    try (FileOutputStream fos = new FileOutputStream(fileName);
+         // UTF-8 인코딩 설정
+         OutputStreamWriter osw = new OutputStreamWriter(fos, StandardCharsets.UTF_8)) {
+        
+        // [핵심] 엑셀 한글 깨짐 방지를 위한 BOM(Byte Order Mark) 삽입
+        osw.write('\uFEFF'); 
+
+        try (BufferedWriter bw = new BufferedWriter(osw)) {
+            for (String[] row : rows) {
+                StringBuilder line = new StringBuilder();
+                for (int i = 0; i < row.length; i++) {
+                    if (i > 0) line.append(",");
+                    // 데이터 내 따옴표 처리 및 줄바꿈/공백 정리
+                    String val = (row[i] == null) ? "" : row[i];
+                    val = val.replace("\"", "\"\"").replace("\n", " ").replace("\r", "");
+                    line.append("\"").append(val).append("\"");
+                }
+                bw.write(line.toString());
+                bw.newLine();
+            }
+        }
+    }
+}
