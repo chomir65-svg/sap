@@ -1,0 +1,43 @@
+private static String extractEvidence(JCoFunction func, String rfcName) {
+    try {
+        if ("RFC_SYSTEM_INFO".equals(rfcName)) {
+            JCoParameterList exp = func.getExportParameterList();
+            if (exp == null) return "PARSE_ERROR: Export List Null";
+            
+            // 1. 우선 가장 안전한 방법으로 구조체를 가져옵니다.
+            JCoStructure si;
+            try {
+                si = exp.getStructure("RFCSI_EXPORT");
+            } catch (Exception e) {
+                return "PARSE_ERROR: Structure RFCSI_EXPORT not found in this SAP version";
+            }
+
+            // 2. [핵심] 필드명을 직접 지정하지 않고, 존재하는 모든 필드를 순회하여 긁어옵니다.
+            // 이렇게 하면 RFCSYSREL이 있든 없든 에러 없이 모든 정보를 가져옵니다.
+            StringBuilder sb = new StringBuilder();
+            JCoRecordFieldIterator iter = si.getFieldIterator();
+            while (iter.hasNextField()) {
+                JCoRecordField field = iter.nextField();
+                String name = field.getName();
+                String value = String.valueOf(field.getValue()).trim();
+                
+                // 너무 긴 필드는 제외하고 주요 정보만 수집 (선택 사항)
+                if (!value.isEmpty() && value.length() < 100) {
+                    sb.append(name).append(":").append(value).append(" | ");
+                }
+            }
+            return sb.toString().isEmpty() ? "SUCCESS_BUT_EMPTY_STRUCTURE" : sb.toString();
+        }
+        
+        if (rfcName.contains("READ_TABLE")) {
+            JCoParameterList tables = func.getTableParameterList();
+            if (tables != null) {
+                JCoTable data = tables.getTable("DATA");
+                return data.getNumRows() > 0 ? "Table Data Sample Found (" + data.getNumRows() + " rows)" : "Empty Table";
+            }
+        }
+    } catch (Exception e) { 
+        return "PARSE_ERROR: " + e.getClass().getSimpleName() + " - " + e.getMessage(); 
+    }
+    return "SUCCESS_NO_DATA";
+}
