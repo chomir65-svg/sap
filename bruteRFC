@@ -1,0 +1,97 @@
+import com.sap.conn.jco.*;
+import java.util.Properties;
+import java.io.File;
+import java.io.FileOutputStream;
+
+public class RfcAuditTool {
+    public static void main(String[] args) {
+        String destName = "AUDIT_DEST";
+        Properties props = new Properties();
+
+        // 1. 접속 정보 설정
+        props.setProperty("jco.client.ashost", "SAP_IP_ADDRESS");
+        props.setProperty("jco.client.sysnr",  "00");
+        props.setProperty("jco.client.client", "100");
+        props.setProperty("jco.client.user",   "YOUR_ID");
+        props.setProperty("jco.client.passwd", "YOUR_PW");
+        props.setProperty("jco.client.lang",   "KO");
+
+        try {
+            createDestinationFile(destName, props);
+            JCoDestination destination = JCoDestinationManager.getDestination(destName);
+            
+            System.out.println("=== [SAP RFC 권한 및 포싱 진단 시작] ===");
+            destination.ping();
+            System.out.println("[+] 연결 성공: " + destination.getAttributes().getHost());
+
+            // 1단계: 표준 검색 시도
+            System.out.println("\n--- [1. 표준 검색 (Search) 시도] ---");
+            findRfcByPattern(destination, "Z*"); 
+
+            // 2단계: 무차별 대입 (Brute-force) - 리스트에 있는 걸 하나씩 찔러봄
+            System.out.println("\n--- [2. 주요 위험 RFC 무차별 대입(Forcing) 시작] ---");
+            
+            // 실제 PoC나 진단에서 가장 많이 쓰이는 'Most Wanted' 리스트
+            String[] wordlist = {
+                "RFC_READ_TABLE", "RFC_GET_FUNCTION_SEARCH", "RFC_SYSTEM_INFO",
+                "EPS_GET_DIRECTORY_LISTING", "EPS_FILE_DELETE", "EPS_FILE_RENAME",
+                "RZL_READ_FILE_LOCAL", "RZL_WRITE_FILE_LOCAL", 
+                "SXPG_COMMAND_EXECUTE", "SXPG_CALL_SYSTEM",
+                "TH_USER_LIST", "TH_DELETE_USER",
+                "BAPI_USER_GET_DETAIL", "BAPI_USER_CHANGE", "BAPI_USER_CREATE",
+                "RFC_REMOTE_EXEC", "RFC_REMOTE_PIPE",
+                "SUSR_RFC_USER_INTERFACE", "RFC_ABAP_INSTALL_AND_RUN"
+            };
+
+            bruteForceRfcs(destination, wordlist);
+
+        } catch (Exception e) {
+            System.err.println("[!] 에러 발생: " + e.getMessage());
+        }
+    }
+
+    // 포싱(무차별 대입) 핵심 메서드
+    public static void bruteForceRfcs(JCoDestination dest, String[] list) {
+        int foundCount = 0;
+        for (String rfcName : list) {
+            try {
+                // getFunction 호출 시 서버에서 해당 함수의 메타데이터를 가져오려고 시도함
+                JCoFunction function = dest.getRepository().getFunction(rfcName);
+                
+                if (function != null) {
+                    System.out.println("[★발견★] 호출 가능: " + rfcName);
+                    foundCount++;
+                }
+            } catch (Exception e) {
+                // 권한이 없거나 함수가 없으면 에러가 나지만, 무시하고 다음으로 넘어감
+                // System.out.println("[-] " + rfcName + " : 접근 불가");
+            }
+        }
+        System.out.println("\n[+] 포싱 결과: 총 " + foundCount + "개의 유효한 RFC를 찾아냈습니다.");
+    }
+
+    public static void findRfcByPattern(JCoDestination dest, String pattern) {
+        try {
+            JCoFunction searchFunc = dest.getRepository().getFunction("RFC_GET_FUNCTION_SEARCH");
+            if (searchFunc == null) {
+                System.out.println("[-] 검색 기능이 차단됨 (RFC_GET_FUNCTION_SEARCH 사용 불가)");
+                return;
+            }
+            searchFunc.getImportParameterList().setValue("FUNCNAME", pattern);
+            searchFunc.execute(dest);
+            JCoTable table = searchFunc.getTableParameterList().getTable("FUNCTIONS");
+            if (table.getNumRows() > 0) {
+                System.out.println("[+] 검색으로 발견: " + table.getNumRows() + "개");
+            }
+        } catch (Exception e) {
+            System.out.println("[-] 검색 권한 없음");
+        }
+    }
+
+    static void createDestinationFile(String name, Properties props) throws Exception {
+        File destFile = new File(name + ".jcoDestination");
+        try (FileOutputStream fos = new FileOutputStream(destFile)) {
+            props.store(fos, "RFC Audit Config");
+        }
+    }
+}
