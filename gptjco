@@ -1,0 +1,192 @@
+import com.sap.conn.jco.*;
+import java.util.*;
+import java.io.*;
+
+public class SapRfcExposureAuditSafe {
+    private static final String DEST_NAME = "SAFE_AUDIT_DEST";
+
+    public static void main(String[] args) {
+        Properties props = new Properties();
+
+        // 현장 정보로 수정
+        props.setProperty("jco.client.ashost", "SAP_IP");
+        props.setProperty("jco.client.sysnr",  "00");
+        props.setProperty("jco.client.client", "100");
+        props.setProperty("jco.client.user",   "USER_ID");
+        props.setProperty("jco.client.passwd", "PASSWORD");
+        props.setProperty("jco.client.lang",   "KO");
+
+        List<String> targets = Arrays.asList(
+            // 정상 업무 RFC 예시
+            "ZFT_RFC_OUTGOING_PMT_INFO",
+            "ZFT_RFC_CUST_MASTER",
+            "ZFT_RFC_VENDOR_DATA",
+
+            // 지적받은 고위험 RFC 예시
+            "SXPG_COMMAND_EXECUTE",
+            "SXPG_CALL_SYSTEM",
+            "RFC_ABAP_INSTALL_AND_RUN",
+            "RZL_READ_FILE_LOCAL",
+            "RZL_WRITE_FILE_LOCAL",
+            "EPS_GET_DIRECTORY_LISTING",
+            "RFC_READ_TABLE",
+            "BBP_RFC_READ_TABLE",
+            "DSY_READ_TABLE",
+            "TH_DB_TABLE_INFO",
+            "BAPI_USER_GET_DETAIL",
+            "BAPI_USER_CHANGE",
+            "BAPI_USER_LOCK",
+            "BAPI_USER_UNLOCK",
+            "RFC_SYSTEM_INFO",
+            "TH_USER_LIST"
+        );
+
+        try {
+            createDestinationFile(DEST_NAME, props);
+
+            JCoDestination dest = JCoDestinationManager.getDestination(DEST_NAME);
+            JCoAttributes attr = dest.getAttributes();
+
+            System.out.println("==================================================");
+            System.out.println("[SAP RFC 비파괴 권한 노출 점검]");
+            System.out.println("==================================================");
+            System.out.println("System ID : " + safe(attr.getSystemID()));
+            System.out.println("Client    : " + safe(attr.getClient()));
+            System.out.println("User      : " + safe(attr.getUser()));
+            System.out.println("Host      : " + safe(attr.getHost()));
+            System.out.println();
+
+            List<String[]> csvRows = new ArrayList<>();
+            csvRows.add(new String[]{
+                "RFC_NAME", "STATUS", "IMPORT_PARAMS", "EXPORT_PARAMS", "TABLE_PARAMS", "DETAIL"
+            });
+
+            JCoRepository repo = dest.getRepository();
+
+            for (String rfcName : targets) {
+                inspectFunction(repo, rfcName, csvRows);
+            }
+
+            writeCsv("sap_rfc_exposure_report.csv", csvRows);
+            System.out.println("\n[+] CSV 저장 완료: sap_rfc_exposure_report.csv");
+
+        } catch (Exception e) {
+            System.err.println("[!] 점검 실패: " + e.getMessage());
+            e.printStackTrace();
+        }
+    }
+
+    private static void inspectFunction(JCoRepository repo, String rfcName, List<String[]> csvRows) {
+        System.out.println("--------------------------------------------------");
+        System.out.println("RFC: " + rfcName);
+
+        try {
+            JCoFunction func = repo.getFunction(rfcName);
+
+            if (func == null) {
+                System.out.println("  상태: 서버 저장소에서 조회되지 않음");
+                csvRows.add(new String[]{rfcName, "NOT_FOUND", "", "", "", "Repository lookup returned null"});
+                return;
+            }
+
+            String imports = summarizeParams(func.getImportParameterList());
+            String exports = summarizeParams(func.getExportParameterList());
+            String tables  = summarizeParams(func.getTableParameterList());
+
+            System.out.println("  상태: 저장소 노출 확인");
+            System.out.println("  Import: " + imports);
+            System.out.println("  Export: " + exports);
+            System.out.println("  Tables: " + tables);
+
+            csvRows.add(new String[]{
+                rfcName,
+                "EXPOSED_IN_REPOSITORY",
+                imports,
+                exports,
+                tables,
+                "Function metadata is visible to the connected account"
+            });
+
+        } catch (JCoException e) {
+            String detail = sanitize(e.getMessage());
+
+            System.out.println("  상태: 예외");
+            System.out.println("  상세: " + detail);
+
+            csvRows.add(new String[]{
+                rfcName,
+                "ERROR",
+                "",
+                "",
+                "",
+                detail
+            });
+        }
+    }
+
+    private static String summarizeParams(JCoParameterList list) {
+        if (list == null) return "-";
+
+        try {
+            JCoListMetaData meta = list.getMetaData();
+            if (meta == null || meta.getFieldCount() == 0) return "-";
+
+            StringBuilder sb = new StringBuilder();
+            int limit = Math.min(meta.getFieldCount(), 8); // 너무 길지 않게
+
+            for (int i = 0; i < limit; i++) {
+                if (i > 0) sb.append(" | ");
+                sb.append(meta.getName(i));
+                try {
+                    sb.append("(").append(meta.getTypeAsString(i)).append(")");
+                } catch (Exception ignore) {
+                    sb.append("(type?)");
+                }
+            }
+
+            if (meta.getFieldCount() > limit) {
+                sb.append(" | ... total=").append(meta.getFieldCount());
+            }
+
+            return sb.toString();
+        } catch (Exception e) {
+            return "param-read-error";
+        }
+    }
+
+    private static void writeCsv(String fileName, List<String[]> rows) throws IOException {
+        try (BufferedWriter bw = new BufferedWriter(new OutputStreamWriter(
+                new FileOutputStream(fileName), "UTF-8"))) {
+            for (String[] row : rows) {
+                bw.write(csvEscape(row[0]) + "," +
+                         csvEscape(row[1]) + "," +
+                         csvEscape(row[2]) + "," +
+                         csvEscape(row[3]) + "," +
+                         csvEscape(row[4]) + "," +
+                         csvEscape(row[5]));
+                bw.newLine();
+            }
+        }
+    }
+
+    private static String csvEscape(String s) {
+        if (s == null) return "\"\"";
+        return "\"" + s.replace("\"", "\"\"") + "\"";
+    }
+
+    private static String sanitize(String s) {
+        if (s == null) return "";
+        return s.replaceAll("[\\r\\n]+", " ").trim();
+    }
+
+    private static String safe(String s) {
+        return s == null ? "" : s;
+    }
+
+    private static void createDestinationFile(String name, Properties props) throws Exception {
+        File destFile = new File(name + ".jcoDestination");
+        try (FileOutputStream fos = new FileOutputStream(destFile)) {
+            props.store(fos, "Safe SAP RFC Audit Destination");
+        }
+    }
+}
